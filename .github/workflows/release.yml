@@ -1,126 +1,65 @@
-name: Release
+name: Build RISC-V 64
 
 on:
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "Existing tag to release (e.g. v0.2.0)"
-        required: true
-        type: string
-      prerelease:
-        description: "Mark as pre-release"
-        required: false
-        type: boolean
-        default: false
-      draft:
-        description: "Create as draft"
-        required: false
-        type: boolean
-        default: false
-      upload_tos:
-        description: "Upload to Volcengine TOS"
-        required: false
-        type: boolean
-        default: true
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
 
 jobs:
-  release:
-    name: GoReleaser Release
+  build-riscv64:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      packages: write
     steps:
-      - name: Verify tag exists
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          if ! gh api "repos/${{ github.repository }}/git/ref/tags/${{ inputs.tag }}" --silent 2>/dev/null; then
-            echo "::error::Tag '${{ inputs.tag }}' does not exist. Create it first using the 'Create Tag' workflow."
-            exit 1
-          fi
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Checkout tag
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-          ref: ${{ inputs.tag }}
-
-      - name: Setup Go from go.mod
-        id: setup-go
-        uses: actions/setup-go@v6
+      - name: Setup Go
+        uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
 
+      # PicoClaw 的 Web UI 需要前端构建后嵌入二进制，保留这三步
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@v4
         with:
           version: 10.33.0
           run_install: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: pnpm
           cache-dependency-path: web/frontend/pnpm-lock.yaml
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v4
-        with:
-          registry: docker.io
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Install zip
-        run: sudo apt-get install -y zip
-
-      - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v7
-        with:
-          distribution: goreleaser
-          version: ~> v2
-          args: release --clean
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
-          DOCKERHUB_IMAGE_NAME: ${{ vars.DOCKERHUB_REPOSITORY }}
-          GOVERSION: ${{ steps.setup-go.outputs.go-version }}
-          INCLUDE_ANDROID_BUNDLE: "true"
-          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
-          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
-          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
-          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
-          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
-
-      - name: Apply release flags
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build frontend
+        working-directory: web/frontend
         run: |
-          gh release edit "${{ inputs.tag }}" \
-            --draft=${{ inputs.draft }} \
-            --prerelease=${{ inputs.prerelease }}
+          pnpm install --frozen-lockfile
+          pnpm run build
 
-  upload-tos:
-    name: Upload to TOS
-    needs: release
-    if: ${{ inputs.upload_tos }}
-    uses: ./.github/workflows/upload-tos.yml
-    with:
-      tag: ${{ inputs.tag }}
-    secrets: inherit
+      # 交叉编译 RISC-V 64 静态二进制
+      - name: Build picoclaw for riscv64
+        env:
+          GOOS: linux
+          GOARCH: riscv64
+          CGO_ENABLED: '0'
+        run: |
+          go mod download
+          go build -trimpath -ldflags="-s -w" -o picoclaw_linux_riscv64 ./cmd/picoclaw
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: picoclaw_linux_riscv64
+          path: picoclaw_linux_riscv64
+
+      # 可选：打 tag 时自动发 Release，方便设备 wget 下载
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: picoclaw_linux_riscv64
